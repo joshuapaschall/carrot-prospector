@@ -1,43 +1,65 @@
 # carrot-prospector
 
-Discovery spike for validating two assumptions using only public data.
+Discovery and lead-enrichment pipeline for real estate wholesaler websites using public web data.
 
-## What this does
+## Full pipeline
 
-- `detect.py`: probes domains with one HTTP GET and flags whether the `server` response header contains `carrot`.
-- `ct_probe.py`: collects potential `*.oncarrot.com` hostnames from certificate transparency sources.
+1. `keywords.txt` (4,934 search queries) + `negative_keywords.txt` (3,729 exclusions)
+2. `python3 seed_harvest.py`
+   - Pulls candidate domains from:
+     - DuckDuckGo SERPs (primary)
+     - Carrot showcase/review pages
+     - Facebook Ad Library (optional)
+   - Writes:
+     - `seeds.txt` (final filtered domains)
+     - `seed_sources.json` (domain → source labels)
+     - `serp_progress.txt` (resume ledger)
+     - `seeds_partial.txt` (safety checkpoints)
+3. `python3 run_pipeline.py`
+   - Reads `seeds.txt`
+   - Verifies domains by HTTP 200 response
+   - Detects whether each domain appears to be Carrot-hosted (`is_carrot`)
+   - Scrapes contact details
+   - Writes `carrot_leads.csv`
 
-## Data sources and use policy
+## Resume capability
 
-This project uses **public data only**:
+`seed_harvest.py` is resumable:
 
-- Certificate Transparency logs (`crt.sh` and certSpotter issuances API)
-- Public HTTP response headers
+- On startup, it loads completed queries from `serp_progress.txt`.
+- Re-running the script skips already-completed query lines and continues from where it left off.
+- On interruption (`Ctrl+C`), it prints:
+  - `Interrupted. Progress saved. Re-run to resume.`
+  - and preserves checkpoint data in `seeds_partial.txt`.
 
-Intended use is **B2B competitive research / lead generation only**.
+## Facebook token setup (optional)
 
-Requirements for ethical/compliant use:
+Set an access token before running harvest if you want Facebook Ad Library source data:
 
-- Outreach must go from a **separate dedicated/warmed sending domain**.
-- Honor **opt-outs** and comply with **CAN-SPAM**.
+```bash
+export FB_ACCESS_TOKEN='your-token-here'
+python3 seed_harvest.py
+```
+
+If `FB_ACCESS_TOKEN` is missing, Facebook harvesting is skipped automatically.
+
+## Output schema (`carrot_leads.csv`)
+
+Columns:
+
+- `domain`
+- `business_name`
+- `phone`
+- `email`
+- `city`
+- `state`
+- `is_carrot`
+- `source`
+- `detected_at`
+
+## Compliance / responsible use
+
+- Use a **separate dedicated/warmed sending domain** for outreach.
+- Honor opt-outs and comply with **CAN-SPAM**.
 - Respect `robots.txt` and service **rate limits**.
 - **Do NOT cold-text scraped phone numbers**.
-
-## Requirements
-
-- Python 3.11+
-- `httpx`
-- `tldextract`
-
-Install:
-
-```bash
-python -m pip install httpx tldextract
-```
-
-## Usage
-
-```bash
-python detect.py raqhomes.com example.com
-python ct_probe.py
-```
