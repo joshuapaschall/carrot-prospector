@@ -63,3 +63,14 @@ Columns:
 - Honor opt-outs and comply with **CAN-SPAM**.
 - Respect `robots.txt` and service **rate limits**.
 - **Do NOT cold-text scraped phone numbers**.
+
+## Database setup
+
+1. Create a **new Supabase project** for this prospecting database. Do **not** reuse any production project.
+2. Open the Supabase **SQL Editor**.
+3. Paste the full contents of `db/schema.sql`.
+4. Run the SQL to create tables, views, enums, indexes, triggers, and RLS settings.
+
+### Key auth note
+
+The worker and UI server-side code must use the **service_role** key. Never use the **anon** key server-side, because RLS is enabled and anon requests will silently return zero rows.
