@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import html
 import json
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +23,8 @@ USER_AGENT = (
 TIMEOUT_SECONDS = 15.0
 BATCH_SIZE = 100
 MAX_CONCURRENCY = 25
+MAX_PAGES_PER_DOMAIN = 4
+MAX_EXTRA_PAGES = 3
 
 WHOLESALER_PHRASES = [
     "we buy houses",
@@ -113,6 +117,9 @@ REI_PLATFORMS = ["leadpropeller", "investorfuse", "reisift", "reiblackbook", "ba
 
 PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+DISCOVERY_TOKENS = ["contact", "about", "sell", "offer", "cash", "get-started", "getstarted", "who-we-are", "reach"]
+BAD_EMAIL_BITS = ["example.com", "sentry", "wixpress", "godaddy", "your@email", "no-reply"]
+FAKE_PHONES = {"5555555555", "1234567890", "0123456789", "1111111111"}
 
 
 @dataclass
@@ -135,6 +142,53 @@ def get_client() -> Client:
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def registrable_domain(hostname: str) -> str:
+    parts = (hostname or "").lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (hostname or "").lower()
+
+
+def is_internal_link(base_domain: str, parsed_url: Any) -> bool:
+    host = (parsed_url.hostname or "").lower()
+    if not host:
+        return True
+    return registrable_domain(host) == registrable_domain(base_domain)
+
+
+def contains_discovery_token(text: str) -> bool:
+    value = (text or "").lower()
+    return any(token in value for token in DISCOVERY_TOKENS)
+
+
+def discover_internal_links(home_html: str, base_url: str, base_domain: str) -> List[str]:
+    soup = BeautifulSoup(home_html, "html.parser")
+    links: List[str] = []
+    seen: Set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        text = normalize_whitespace(a.get_text(" ", strip=True))
+        hay = f"{href.lower()} {text.lower()}"
+        if not contains_discovery_token(hay):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if not is_internal_link(base_domain, parsed):
+            continue
+        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+        if parsed.query:
+            clean = f"{clean}?{parsed.query}"
+        if clean in seen:
+            continue
+        seen.add(clean)
+        links.append(clean)
+        if len(links) >= MAX_EXTRA_PAGES:
+            break
+    return links
 
 
 def extract_jsonld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
@@ -209,6 +263,142 @@ def extract_city_state(schema_items: List[Dict[str, Any]]) -> Tuple[Optional[str
     return None, None
 
 
+def normalize_phone(candidate: str) -> Optional[str]:
+    digits = re.sub(r"\D", "", candidate or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    if digits in FAKE_PHONES:
+        return None
+    if len(set(digits)) == 1:
+        return None
+    if digits[:3] == "456" or digits[0] in {"0", "1"}:
+        return None
+
+    asc = "0123456789"
+    desc = asc[::-1]
+    if digits in asc or digits in desc:
+        return None
+    if all((int(digits[i + 1]) - int(digits[i]) == 1) for i in range(9)):
+        return None
+    if all((int(digits[i]) - int(digits[i + 1]) == 1) for i in range(9)):
+        return None
+    return digits
+
+
+def is_valid_email(email: str) -> bool:
+    e = (email or "").strip().lower()
+    return bool(e and not any(bit in e for bit in BAD_EMAIL_BITS))
+
+
+def score_phone_context(soup: BeautifulSoup, cleaned_phone: str) -> int:
+    text = soup.get_text(" ", strip=True).lower()
+    score = 0
+    if cleaned_phone in re.sub(r"\D", "", text):
+        score += 1
+    if any(k in text for k in ["phone", "call", "contact"]):
+        score += 2
+    for node in soup.find_all(["footer", "address"]):
+        if cleaned_phone in re.sub(r"\D", "", node.get_text(" ", strip=True)):
+            score += 2
+            break
+    return score
+
+
+def score_email_context(soup: BeautifulSoup, email: str) -> int:
+    text = soup.get_text(" ", strip=True).lower()
+    score = 0
+    if email.lower() in text:
+        score += 1
+    if any(k in text for k in ["email", "contact"]):
+        score += 2
+    for node in soup.find_all(["footer", "address"]):
+        if email.lower() in node.get_text(" ", strip=True).lower():
+            score += 2
+            break
+    return score
+
+
+def extract_contacts_from_page(html_text: str) -> Dict[str, List[str]]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    clean_text = html.unescape(soup.get_text(separator=" ", strip=True))
+    schema_items = extract_jsonld(soup)
+
+    phones_primary: List[str] = []
+    phones_contextual: List[str] = []
+    phones_other: List[str] = []
+
+    emails_primary: List[str] = []
+    emails_contextual: List[str] = []
+    emails_other: List[str] = []
+
+    for item in schema_items:
+        tel = item.get("telephone")
+        if isinstance(tel, str):
+            p = normalize_phone(tel)
+            if p:
+                phones_primary.append(p)
+        em = item.get("email")
+        if isinstance(em, str):
+            e = em.strip().lower()
+            if is_valid_email(e):
+                emails_primary.append(e)
+
+    for link in soup.find_all("a", href=True):
+        href = (link.get("href") or "").strip()
+        if href.lower().startswith("tel:"):
+            p = normalize_phone(href.split(":", 1)[1])
+            if p:
+                phones_primary.append(p)
+        if href.lower().startswith("mailto:"):
+            e = href.split(":", 1)[1].split("?", 1)[0].strip().lower()
+            if is_valid_email(e):
+                emails_primary.append(e)
+
+    for match in PHONE_RE.findall(clean_text):
+        p = normalize_phone(match)
+        if not p:
+            continue
+        contextual_score = score_phone_context(soup, p)
+        if contextual_score >= 2:
+            phones_contextual.append(p)
+        else:
+            phones_other.append(p)
+
+    for match in EMAIL_RE.findall(clean_text):
+        e = match.strip().lower()
+        if not is_valid_email(e):
+            continue
+        contextual_score = score_email_context(soup, e)
+        if contextual_score >= 2:
+            emails_contextual.append(e)
+        else:
+            emails_other.append(e)
+
+    def dedupe_ordered(values: Iterable[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for v in values:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    all_phones = dedupe_ordered([*phones_primary, *phones_contextual, *phones_other])
+    all_emails = dedupe_ordered([*emails_primary, *emails_contextual, *emails_other])
+
+    primary_phone = next(iter(all_phones), None)
+    primary_email = next(iter(all_emails), None)
+
+    return {
+        "primary_phone": primary_phone,
+        "primary_email": primary_email,
+        "all_phones": all_phones,
+        "all_emails": all_emails,
+    }
+
+
 def score_and_classify(domain: str, status_code: Optional[int], html: str, headers: Dict[str, str]) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
     visible_text = normalize_whitespace(soup.get_text(" ", strip=True)).lower()
@@ -236,7 +426,7 @@ def score_and_classify(domain: str, status_code: Optional[int], html: str, heade
     else:
         junk_counts["gov_edu"] = 0
 
-    has_phone = bool(re.search(r"tel:\s*", html_lc) or PHONE_RE.search(combined))
+    has_phone = bool(re.search(r"tel:\s*", html_lc) or PHONE_RE.search(visible_text))
     has_form = has_lead_form(soup, visible_text)
 
     schema_items = extract_jsonld(soup)
@@ -295,35 +485,11 @@ def score_and_classify(domain: str, status_code: Optional[int], html: str, heade
         title = soup.title.string if soup.title and soup.title.string else ""
         business_name = re.split(r"\s+[\-|\|]\s+", title)[0].strip() if title else None
 
-    phone = pick_jsonld_value(schema_items, "telephone")
-    if not phone:
-        tel = soup.find("a", href=re.compile(r"^tel:", re.IGNORECASE))
-        if tel and tel.get("href"):
-            phone = tel.get("href").split(":", 1)[1].strip()
-    if not phone:
-        m = PHONE_RE.search(combined)
-        phone = m.group(0) if m else None
-
-    email = pick_jsonld_value(schema_items, "email")
-    if not email:
-        mailto = soup.find("a", href=re.compile(r"^mailto:", re.IGNORECASE))
-        if mailto and mailto.get("href"):
-            email = mailto.get("href").split(":", 1)[1].split("?")[0].strip()
-    if not email:
-        em = EMAIL_RE.search(combined)
-        email = em.group(0) if em else None
-    if email:
-        bad_bits = ["example.com", "sentry", "wixpress", "godaddy", "your@email"]
-        if any(x in email.lower() for x in bad_bits):
-            email = None
-
     city, state = extract_city_state(schema_items)
 
     phrases_found = sorted(set(wholesaler_hits) | set(agent_hits) | set(investor_hits))
     return {
         "business_name": business_name or None,
-        "phone": phone,
-        "email": email,
         "city": city,
         "state": state,
         "is_carrot": is_carrot,
@@ -363,6 +529,16 @@ async def fetch_homepage(client: httpx.AsyncClient, domain: str) -> FetchResult:
     return FetchResult(None, None, {}, None, "unreachable")
 
 
+async def fetch_url(client: httpx.AsyncClient, url: str) -> FetchResult:
+    try:
+        resp = await client.get(url)
+        return FetchResult(resp.status_code, resp.text or "", {k.lower(): v for k, v in resp.headers.items()}, str(resp.url), None)
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
+        return FetchResult(None, None, {}, None, "unreachable")
+    except httpx.HTTPError as exc:
+        return FetchResult(None, None, {}, None, str(exc))
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -386,6 +562,40 @@ async def process_domain(sem: asyncio.Semaphore, client: httpx.AsyncClient, row:
             }
 
         computed = score_and_classify(domain, fetched.status_code, fetched.html, fetched.headers)
+
+        page_htmls = [fetched.html]
+        if fetched.url:
+            for link in discover_internal_links(fetched.html, fetched.url, domain):
+                extra = await fetch_url(client, link)
+                if extra.html:
+                    page_htmls.append(extra.html)
+                if len(page_htmls) >= MAX_PAGES_PER_DOMAIN:
+                    break
+
+        all_phones: List[str] = []
+        all_emails: List[str] = []
+        primary_phone: Optional[str] = None
+        primary_email: Optional[str] = None
+
+        for html_page in page_htmls:
+            contacts = extract_contacts_from_page(html_page)
+            if not primary_phone and contacts["primary_phone"]:
+                primary_phone = contacts["primary_phone"]
+            if not primary_email and contacts["primary_email"]:
+                primary_email = contacts["primary_email"]
+            for p in contacts["all_phones"]:
+                if p not in all_phones:
+                    all_phones.append(p)
+            for e in contacts["all_emails"]:
+                if e not in all_emails:
+                    all_emails.append(e)
+
+        existing_phone = row.get("phone")
+        existing_email = row.get("email")
+        computed["phone"] = primary_phone or existing_phone
+        computed["email"] = primary_email or existing_email
+        computed["signals"]["all_phones"] = all_phones
+        computed["signals"]["all_emails"] = all_emails
         computed["last_scraped_at"] = now_iso()
         return {"id": row["id"], "domain": domain, "update": computed, "persona": computed["persona"]}
 
@@ -402,7 +612,7 @@ def update_job(sb: Client, job_id: str, fields: Dict[str, Any]) -> None:
 
 
 def get_batch(sb: Client, limit: int) -> List[Dict[str, Any]]:
-    resp = sb.table("domains").select("id,domain").is_("last_scraped_at", "null").limit(limit).execute()
+    resp = sb.table("domains").select("id,domain,phone,email").is_("last_scraped_at", "null").limit(limit).execute()
     return resp.data or []
 
 
@@ -412,8 +622,8 @@ def run_self_test() -> None:
         ("agent.test", "<html><body>homes for sale MLS free home valuation Keller Williams re/max list your home view listings property search call us 212-555-1212 <form><input name='name'/><input name='phone'/></form></body></html>"),
         ("junk.test", "<html><body>mortgage rates refinance NMLS licensed loan officer</body></html>"),
     ]
-    for domain, html in tests:
-        out = score_and_classify(domain, 200, html, {"server": "nginx"})
+    for domain, html_src in tests:
+        out = score_and_classify(domain, 200, html_src, {"server": "nginx"})
         print((out["persona"], out["confidence_score"], out["qualified"]))
 
 
