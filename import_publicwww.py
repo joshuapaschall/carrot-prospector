@@ -122,11 +122,6 @@ def insert_new_domains(client: Client, domains: List[str]) -> int:
             {
                 "domain": domain,
                 "source": "publicwww",
-                "phone": None,
-                "email": None,
-                "persona": None,
-                "qualified": None,
-                "last_scraped_at": None,
                 "signals": {"publicwww": True},
             }
             for domain in batch
