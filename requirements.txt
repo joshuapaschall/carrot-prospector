@@ -2,3 +2,4 @@ supabase
 httpx
 tldextract
 python-dotenv
+beautifulsoup4
