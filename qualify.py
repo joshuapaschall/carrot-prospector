@@ -118,6 +118,35 @@ REI_PLATFORMS = ["leadpropeller", "investorfuse", "reisift", "reiblackbook", "ba
 PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 DISCOVERY_TOKENS = ["contact", "about", "sell", "offer", "cash", "get-started", "getstarted", "who-we-are", "reach"]
+PLACEHOLDER_EMAILS = {
+    "name@domain.com",
+    "you@example.com",
+    "user@example.com",
+    "email@example.com",
+    "test@test.com",
+    "your@email.com",
+    "john@doe.com",
+    "first.last@example.com",
+}
+PLACEHOLDER_EMAIL_DOMAINS = {
+    "domain.com",
+    "example.com",
+    "example.org",
+    "yourdomain.com",
+    "sentry.io",
+    "wixpress.com",
+    "godaddy.com",
+}
+PLACEHOLDER_EMAIL_LOCALS = {
+    "name",
+    "your",
+    "youremail",
+    "email",
+    "example",
+    "test",
+    "firstname",
+    "lastname",
+}
 BAD_EMAIL_BITS = ["example.com", "sentry", "wixpress", "godaddy", "your@email", "no-reply"]
 FAKE_PHONES = {"5555555555", "1234567890", "0123456789", "1111111111"}
 
@@ -289,7 +318,18 @@ def normalize_phone(candidate: str) -> Optional[str]:
 
 def is_valid_email(email: str) -> bool:
     e = (email or "").strip().lower()
-    return bool(e and not any(bit in e for bit in BAD_EMAIL_BITS))
+    if not e or "@" not in e:
+        return False
+    local_part, domain = e.rsplit("@", 1)
+    if not local_part or not domain:
+        return False
+    if e in PLACEHOLDER_EMAILS:
+        return False
+    if domain in PLACEHOLDER_EMAIL_DOMAINS:
+        return False
+    if local_part in PLACEHOLDER_EMAIL_LOCALS:
+        return False
+    return not any(bit in e for bit in BAD_EMAIL_BITS)
 
 
 def score_phone_context(soup: BeautifulSoup, cleaned_phone: str) -> int:
