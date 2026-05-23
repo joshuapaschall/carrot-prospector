@@ -4,7 +4,9 @@ import asyncio
 import html
 import json
 import os
+import random
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -13,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
 USER_AGENT = (
@@ -120,6 +123,35 @@ EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 DISCOVERY_TOKENS = ["contact", "about", "sell", "offer", "cash", "get-started", "getstarted", "who-we-are", "reach"]
 BAD_EMAIL_BITS = ["example.com", "sentry", "wixpress", "godaddy", "your@email", "no-reply"]
 FAKE_PHONES = {"5555555555", "1234567890", "0123456789", "1111111111"}
+PLACEHOLDER_EMAILS = {
+    "name@domain.com",
+    "you@example.com",
+    "user@example.com",
+    "email@example.com",
+    "test@test.com",
+    "your@email.com",
+    "john@doe.com",
+    "first.last@example.com",
+}
+PLACEHOLDER_EMAIL_DOMAINS = {"domain.com", "example.com", "example.org", "yourdomain.com", "sentry.io", "wixpress.com", "godaddy.com"}
+PLACEHOLDER_EMAIL_LOCALS = {"name", "your", "youremail", "email", "example", "test", "firstname", "lastname"}
+SUPABASE_RETRY_EXCEPTIONS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.PoolTimeout,
+    APIError,
+)
+HTTP_RETRY_EXCEPTIONS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.PoolTimeout,
+)
 
 
 @dataclass
@@ -137,6 +169,7 @@ def get_client() -> Client:
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment/.env")
+    # Keep default client settings for compatibility; retries handle transient HTTP/2 resets.
     return create_client(url, key)
 
 
@@ -289,7 +322,45 @@ def normalize_phone(candidate: str) -> Optional[str]:
 
 def is_valid_email(email: str) -> bool:
     e = (email or "").strip().lower()
-    return bool(e and not any(bit in e for bit in BAD_EMAIL_BITS))
+    if not e:
+        return False
+    if any(bit in e for bit in BAD_EMAIL_BITS):
+        return False
+    if e in PLACEHOLDER_EMAILS:
+        return False
+    if "@" not in e:
+        return False
+    local, domain = e.split("@", 1)
+    if domain in PLACEHOLDER_EMAIL_DOMAINS:
+        return False
+    if local in PLACEHOLDER_EMAIL_LOCALS:
+        return False
+    return True
+
+
+def _is_stream_reset_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "stream reset" in msg or "connection reset" in msg
+
+
+def supabase_execute_with_retry(op_factory: Any, domain: Optional[str], is_write: bool, refresh_client: Optional[Any] = None) -> Any:
+    consecutive_write_conn_failures = 0
+    for attempt in range(5):
+        try:
+            return op_factory().execute()
+        except SUPABASE_RETRY_EXCEPTIONS as exc:
+            if is_write and _is_stream_reset_error(exc):
+                consecutive_write_conn_failures += 1
+            else:
+                consecutive_write_conn_failures = 0
+            if is_write and consecutive_write_conn_failures >= 2 and refresh_client is not None:
+                refresh_client()
+                consecutive_write_conn_failures = 0
+            if attempt == 4:
+                print(f"WARN: Supabase execute failed after retries for domain={domain or 'n/a'} error={exc}")
+                return None
+            delay = (2**attempt) + random.uniform(0, 0.5)
+            time.sleep(delay)
 
 
 def score_phone_context(soup: BeautifulSoup, cleaned_phone: str) -> int:
@@ -519,24 +590,35 @@ def score_and_classify(domain: str, status_code: Optional[int], html: str, heade
 async def fetch_homepage(client: httpx.AsyncClient, domain: str) -> FetchResult:
     for scheme in ("https://", "http://"):
         url = f"{scheme}{domain}"
-        try:
-            resp = await client.get(url)
-            return FetchResult(resp.status_code, resp.text or "", {k.lower(): v for k, v in resp.headers.items()}, str(resp.url), None)
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
-            continue
-        except httpx.HTTPError as exc:
-            return FetchResult(None, None, {}, None, str(exc))
+        for attempt in range(2):
+            try:
+                resp = await client.get(url)
+                return FetchResult(resp.status_code, resp.text or "", {k.lower(): v for k, v in resp.headers.items()}, str(resp.url), None)
+            except HTTP_RETRY_EXCEPTIONS:
+                if attempt == 1:
+                    break
+                await asyncio.sleep((2**attempt) + random.uniform(0, 0.5))
+            except (httpx.TimeoutException, httpx.NetworkError):
+                break
+            except httpx.HTTPError as exc:
+                return FetchResult(None, None, {}, None, str(exc))
     return FetchResult(None, None, {}, None, "unreachable")
 
 
 async def fetch_url(client: httpx.AsyncClient, url: str) -> FetchResult:
-    try:
-        resp = await client.get(url)
-        return FetchResult(resp.status_code, resp.text or "", {k.lower(): v for k, v in resp.headers.items()}, str(resp.url), None)
-    except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
-        return FetchResult(None, None, {}, None, "unreachable")
-    except httpx.HTTPError as exc:
-        return FetchResult(None, None, {}, None, str(exc))
+    for attempt in range(2):
+        try:
+            resp = await client.get(url)
+            return FetchResult(resp.status_code, resp.text or "", {k.lower(): v for k, v in resp.headers.items()}, str(resp.url), None)
+        except HTTP_RETRY_EXCEPTIONS:
+            if attempt == 1:
+                return FetchResult(None, None, {}, None, "unreachable")
+            await asyncio.sleep((2**attempt) + random.uniform(0, 0.5))
+        except (httpx.TimeoutException, httpx.NetworkError):
+            return FetchResult(None, None, {}, None, "unreachable")
+        except httpx.HTTPError as exc:
+            return FetchResult(None, None, {}, None, str(exc))
+    return FetchResult(None, None, {}, None, "unreachable")
 
 
 def now_iso() -> str:
@@ -546,73 +628,83 @@ def now_iso() -> str:
 async def process_domain(sem: asyncio.Semaphore, client: httpx.AsyncClient, row: Dict[str, Any]) -> Dict[str, Any]:
     async with sem:
         domain = row["domain"]
-        fetched = await fetch_homepage(client, domain)
-        if fetched.html is None:
-            return {
-                "id": row["id"],
-                "domain": domain,
-                "update": {
-                    "confidence_score": 0,
-                    "http_status": None,
-                    "qualified": False,
+        try:
+            fetched = await fetch_homepage(client, domain)
+            if fetched.html is None:
+                return {
+                    "id": row["id"],
+                    "domain": domain,
+                    "update": {
+                        "confidence_score": 0,
+                        "http_status": None,
+                        "qualified": False,
+                        "persona": "unreachable",
+                        "last_scraped_at": now_iso(),
+                    },
                     "persona": "unreachable",
-                    "last_scraped_at": now_iso(),
-                },
-                "persona": "unreachable",
-            }
+                }
 
-        computed = score_and_classify(domain, fetched.status_code, fetched.html, fetched.headers)
+            computed = score_and_classify(domain, fetched.status_code, fetched.html, fetched.headers)
 
-        page_htmls = [fetched.html]
-        if fetched.url:
-            for link in discover_internal_links(fetched.html, fetched.url, domain):
-                extra = await fetch_url(client, link)
-                if extra.html:
-                    page_htmls.append(extra.html)
-                if len(page_htmls) >= MAX_PAGES_PER_DOMAIN:
-                    break
+            page_htmls = [fetched.html]
+            if fetched.url:
+                for link in discover_internal_links(fetched.html, fetched.url, domain):
+                    extra = await fetch_url(client, link)
+                    if extra.html:
+                        page_htmls.append(extra.html)
+                    if len(page_htmls) >= MAX_PAGES_PER_DOMAIN:
+                        break
 
-        all_phones: List[str] = []
-        all_emails: List[str] = []
-        primary_phone: Optional[str] = None
-        primary_email: Optional[str] = None
+            all_phones: List[str] = []
+            all_emails: List[str] = []
+            primary_phone: Optional[str] = None
+            primary_email: Optional[str] = None
 
-        for html_page in page_htmls:
-            contacts = extract_contacts_from_page(html_page)
-            if not primary_phone and contacts["primary_phone"]:
-                primary_phone = contacts["primary_phone"]
-            if not primary_email and contacts["primary_email"]:
-                primary_email = contacts["primary_email"]
-            for p in contacts["all_phones"]:
-                if p not in all_phones:
-                    all_phones.append(p)
-            for e in contacts["all_emails"]:
-                if e not in all_emails:
-                    all_emails.append(e)
+            for html_page in page_htmls:
+                contacts = extract_contacts_from_page(html_page)
+                if not primary_phone and contacts["primary_phone"]:
+                    primary_phone = contacts["primary_phone"]
+                if not primary_email and contacts["primary_email"]:
+                    primary_email = contacts["primary_email"]
+                for p in contacts["all_phones"]:
+                    if p not in all_phones:
+                        all_phones.append(p)
+                for e in contacts["all_emails"]:
+                    if e not in all_emails:
+                        all_emails.append(e)
 
-        existing_phone = row.get("phone")
-        existing_email = row.get("email")
-        computed["phone"] = primary_phone or existing_phone
-        computed["email"] = primary_email or existing_email
-        computed["signals"]["all_phones"] = all_phones
-        computed["signals"]["all_emails"] = all_emails
-        computed["last_scraped_at"] = now_iso()
-        return {"id": row["id"], "domain": domain, "update": computed, "persona": computed["persona"]}
+            existing_phone = row.get("phone")
+            existing_email = row.get("email")
+            computed["phone"] = primary_phone or existing_phone
+            computed["email"] = primary_email or existing_email
+            computed["signals"]["all_phones"] = all_phones
+            computed["signals"]["all_emails"] = all_emails
+            computed["last_scraped_at"] = now_iso()
+            return {"id": row["id"], "domain": domain, "update": computed, "persona": computed["persona"]}
+        except Exception as exc:
+            print(f"WARN: domain processing failed; skipping domain={domain} error={exc}")
+            return {"id": row["id"], "domain": domain, "skip_update": True, "persona": "error"}
 
 
 def upsert_job_running(sb: Client, total: int) -> str:
     payload = {"kind": "qualify", "status": "running", "queries_total": total, "queries_done": 0, "domains_qualified": 0}
-    resp = sb.table("jobs").insert(payload).execute()
+    resp = supabase_execute_with_retry(lambda: sb.table("jobs").insert(payload), domain=None, is_write=True)
+    if not resp or not resp.data:
+        raise RuntimeError("Unable to create jobs row after retries")
     return resp.data[0]["id"]
 
 
 def update_job(sb: Client, job_id: str, fields: Dict[str, Any]) -> None:
     fields["updated_at"] = now_iso()
-    sb.table("jobs").update(fields).eq("id", job_id).execute()
+    supabase_execute_with_retry(lambda: sb.table("jobs").update(fields).eq("id", job_id), domain=None, is_write=True)
 
 
 def get_batch(sb: Client, limit: int) -> List[Dict[str, Any]]:
-    resp = sb.table("domains").select("id,domain,phone,email").is_("last_scraped_at", "null").limit(limit).execute()
+    resp = supabase_execute_with_retry(
+        lambda: sb.table("domains").select("id,domain,phone,email").is_("last_scraped_at", "null").limit(limit),
+        domain=None,
+        is_write=False,
+    )
     return resp.data or []
 
 
@@ -629,7 +721,17 @@ def run_self_test() -> None:
 
 async def run(limit: Optional[int]) -> None:
     sb = get_client()
-    total_q = sb.table("domains").select("id", count="exact").is_("last_scraped_at", "null").execute().count or 0
+
+    def refresh_sb() -> None:
+        nonlocal sb
+        sb = get_client()
+
+    total_resp = supabase_execute_with_retry(
+        lambda: sb.table("domains").select("id", count="exact").is_("last_scraped_at", "null"),
+        domain=None,
+        is_write=False,
+    )
+    total_q = (total_resp.count if total_resp else 0) or 0
     if limit is not None:
         total_q = min(total_q, limit)
     job_id = upsert_job_running(sb, total_q)
@@ -654,10 +756,23 @@ async def run(limit: Optional[int]) -> None:
                     break
 
                 tasks = [process_domain(sem, client, row) for row in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=False)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for result in results:
-                    sb.table("domains").update(result["update"]).eq("id", result["id"]).execute()
+                    if isinstance(result, Exception):
+                        print(f"WARN: domain task failed before result: {result}")
+                        continue
+                    if result.get("skip_update"):
+                        continue
+                    try:
+                        supabase_execute_with_retry(
+                            lambda r=result: sb.table("domains").update(r["update"]).eq("id", r["id"]),
+                            domain=result.get("domain"),
+                            is_write=True,
+                            refresh_client=refresh_sb,
+                        )
+                    except Exception as exc:
+                        print(f"WARN: Unhandled write error for domain={result.get('domain')} error={exc}")
                     done += 1
                     if result["update"].get("qualified"):
                         qualified_total += 1
