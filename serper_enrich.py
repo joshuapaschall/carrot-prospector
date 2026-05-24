@@ -133,20 +133,23 @@ def classify_primary(target_domain: str, business_name: Optional[str], serper_em
 
 def fetch_targets(sb: Any, persona: str, limit: Optional[int]) -> List[DomainRow]:
     q = sb.table("domains").select("domain,persona,confidence_score,business_name,email,signals").eq("qualified", True).is_("email", "null")
-    q = q.or_("signals.is.null,signals->>serper_enrich_done.neq.true")
     if persona != "all":
         q = q.eq("persona", persona)
     resp = supabase_execute_with_retry(lambda: q.limit(limit or 50000), domain=None, is_write=False)
     data = (resp.data if resp and hasattr(resp, "data") else []) or []
     rows: List[DomainRow] = []
     for r in data:
+        signals = r.get("signals") if isinstance(r.get("signals"), dict) else {}
+        done_value = (signals or {}).get("serper_enrich_done")
+        if done_value in (True, "true"):
+            continue
         rows.append(DomainRow(
             domain=r.get("domain") or "",
             persona=r.get("persona"),
             confidence_score=float(r.get("confidence_score") or 0),
             business_name=r.get("business_name"),
             email=r.get("email"),
-            signals=r.get("signals") if isinstance(r.get("signals"), dict) else {},
+            signals=signals,
         ))
     rows.sort(key=lambda x: (x.persona == "wholesaler", x.persona == "investor", x.confidence_score), reverse=True)
     return rows[:limit] if limit else rows
