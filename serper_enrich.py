@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--persona", choices=["wholesaler", "investor", "agent_realtor", "all"], default="all")
     p.add_argument("--min-credits", type=int, default=500)
+    p.add_argument("--max-credits", type=int, default=7000)
+    p.add_argument("--num", type=int, default=20)
     p.add_argument("--self-test", action="store_true")
     return p.parse_args()
 
@@ -95,10 +97,10 @@ def is_valid_enrich_email(email: str) -> bool:
     return True
 
 
-def extract_serper_emails(organic: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
-    found: Dict[str, str] = {}
+def extract_serper_emails(organic: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    found: Dict[str, Dict[str, Any]] = {}
     texts: Dict[str, str] = {}
-    for item in organic or []:
+    for position, item in enumerate(organic or [], start=1):
         title = str(item.get("title") or "")
         snippet = str(item.get("snippet") or "")
         link = str(item.get("link") or "")
@@ -108,12 +110,12 @@ def extract_serper_emails(organic: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
             if not is_valid_enrich_email(em):
                 continue
             if em not in found:
-                found[em] = link
+                found[em] = {"source_url": link, "position": position}
                 texts[em] = blob.lower()
-    return [{"email": k, "source_url": v} for k, v in found.items()], texts
+    return [{"email": k, "source_url": v["source_url"], "position": v["position"]} for k, v in found.items()], texts
 
 
-def classify_primary(target_domain: str, business_name: Optional[str], serper_emails: List[Dict[str, str]], texts: Dict[str, str]) -> str:
+def classify_primary(target_domain: str, business_name: Optional[str], serper_emails: List[Dict[str, Any]], texts: Dict[str, str]) -> str:
     t = normalized_domain(target_domain)
     for item in serper_emails:
         dom = item["email"].split("@", 1)[1]
@@ -129,6 +131,21 @@ def classify_primary(target_domain: str, business_name: Optional[str], serper_em
         if dom in FREE_PROVIDERS and bn and bn in texts.get(item["email"], ""):
             return item["email"]
     return ""
+
+
+def compute_position_histogram(serper_emails_all: List[Dict[str, Any]]) -> Dict[str, int]:
+    histogram = {"1-3": 0, "4-10": 0, "11-20": 0, ">20": 0}
+    for item in serper_emails_all:
+        pos = int(item.get("position") or 0)
+        if 1 <= pos <= 3:
+            histogram["1-3"] += 1
+        elif 4 <= pos <= 10:
+            histogram["4-10"] += 1
+        elif 11 <= pos <= 20:
+            histogram["11-20"] += 1
+        elif pos > 20:
+            histogram[">20"] += 1
+    return histogram
 
 
 def fetch_targets(sb: Any, persona: str, limit: Optional[int]) -> List[DomainRow]:
@@ -162,14 +179,42 @@ def run_self_test() -> None:
     assert classify_primary("wanttosellnow.com", "", emails, texts) == "info@wanttosellnow.com"
     assert any(x["source_url"] == "https://wanttosellnow.com/contact" for x in emails if x["email"] == "info@wanttosellnow.com")
 
-    organic2 = [{"title": "Team", "snippet": "info@x.com jane@x.com", "link": "https://x.com/about"}]
+    organic2 = [
+        {"title": "no email", "snippet": "", "link": "https://x.com/one"},
+        {"title": "no email", "snippet": "", "link": "https://x.com/two"},
+        {"title": "Team", "snippet": "info@x.com jane@x.com", "link": "https://x.com/about"},
+    ]
     emails2, texts2 = extract_serper_emails(organic2)
     assert len(emails2) == 2
+    assert any(x["email"] == "info@x.com" and x["position"] == 3 for x in emails2)
     assert classify_primary("x.com", None, emails2, texts2).endswith("@x.com")
 
     organic3 = [{"title": "dir", "snippet": "name@domain.com x@facebook.com", "link": "https://facebook.com/x"}]
     emails3, _ = extract_serper_emails(organic3)
     assert len(emails3) == 0
+
+    budget_stop = {"stop": False}
+    requests_made = {"value": 0}
+    max_credits = 2
+    for _ in range(4):
+        if budget_stop["stop"]:
+            continue
+        if requests_made["value"] >= max_credits:
+            budget_stop["stop"] = True
+            continue
+        requests_made["value"] += 1
+    assert budget_stop["stop"] is True and requests_made["value"] == 2
+
+    hist = compute_position_histogram([
+        {"email": "a@x.com", "source_url": "u", "position": 1},
+        {"email": "b@x.com", "source_url": "u", "position": 3},
+        {"email": "c@x.com", "source_url": "u", "position": 4},
+        {"email": "d@x.com", "source_url": "u", "position": 10},
+        {"email": "e@x.com", "source_url": "u", "position": 11},
+        {"email": "f@x.com", "source_url": "u", "position": 20},
+        {"email": "g@x.com", "source_url": "u", "position": 21},
+    ])
+    assert hist == {"1-3": 2, "4-10": 2, "11-20": 2, ">20": 1}
 
     emails4, texts4 = extract_serper_emails([])
     primary4 = classify_primary("none.com", "", emails4, texts4)
@@ -195,8 +240,10 @@ async def main_async(args: argparse.Namespace) -> None:
 
     sem = asyncio.Semaphore(SERPER_CONCURRENCY)
     lock = threading.Lock()
-    last_credits = {"value": 10**9}
     stop_flag = {"stop": False}
+    stop_reason = {"budget": False}
+    requests_made = {"value": 0}
+    credits_spent_this_run = {"value": 0}
     processed = 0
     emails_found_total = 0
     domains_with_primary = 0
@@ -211,17 +258,19 @@ async def main_async(args: argparse.Namespace) -> None:
                     with lock:
                         if stop_flag["stop"]:
                             return
-                        if last_credits["value"] <= args.min_credits:
+                        if requests_made["value"] >= args.max_credits:
                             stop_flag["stop"] = True
+                            stop_reason["budget"] = True
                             return
+                        requests_made["value"] += 1
                     query = '"@' + row.domain + '"'
-                    payload = {"q": query, "num": 10, "gl": "us"}
+                    payload = {"q": query, "num": args.num, "gl": "us"}
                     resp = await client.post(SERPER_URL, headers={"X-API-KEY": serper_key}, json=payload)
                     resp.raise_for_status()
                     body = resp.json()
-                    credits = int(body.get("credits", last_credits["value"]))
+                    request_cost = int(body.get("credits", 1))
                     with lock:
-                        last_credits["value"] = credits
+                        credits_spent_this_run["value"] += request_cost
 
                     serper_emails, texts = extract_serper_emails(body.get("organic") or [])
                     primary = classify_primary(row.domain, row.business_name, serper_emails, texts)
@@ -229,7 +278,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     new_signals = dict(row.signals or {})
                     new_signals["serper_emails"] = serper_emails
                     new_signals["serper_enrich_done"] = True
-                    new_signals["serper_enrich_credits_at"] = credits
+                    new_signals["serper_request_cost"] = request_cost
 
                     update_payload: Dict[str, Any] = {"signals": new_signals}
                     if (not row.email or not row.email.strip()) and primary:
@@ -258,16 +307,24 @@ async def main_async(args: argparse.Namespace) -> None:
                             "source_urls_json": json.dumps([x.get("source_url") for x in serper_emails]),
                         })
                         if processed % BATCH_LOG_EVERY == 0:
-                            print(f"processed={processed} remaining_credits={last_credits['value']} emails_found_total={emails_found_total} domains_with_primary_email={domains_with_primary} domains_no_email={domains_no_email}")
+                            print(f"processed={processed} requests_made={requests_made['value']} credits_spent_this_run={credits_spent_this_run['value']} emails_found_total={emails_found_total} domains_with_primary_email={domains_with_primary} domains_no_email={domains_no_email}")
             except Exception as e:
                 print(f"ERROR domain={row.domain} error={e}")
 
         await asyncio.gather(*[worker(r) for r in rows])
 
     remaining = max(total - processed, 0)
-    if stop_flag["stop"]:
-        print(f"STOPPED due to credit floor. processed={processed} remaining={remaining} credits={last_credits['value']} floor={args.min_credits}")
-    print(f"SUMMARY processed={processed} total_targets={total} remaining={remaining} credits={last_credits['value']} emails_found_total={emails_found_total} domains_with_primary_email={domains_with_primary} domains_no_email={domains_no_email}")
+    if stop_reason["budget"]:
+        print(f"STOPPED: hit --max-credits budget of {args.max_credits} (requests_made={requests_made['value']})")
+    print(f"SUMMARY processed={processed} total_targets={total} remaining={remaining} requests_made={requests_made['value']} credits_spent_this_run={credits_spent_this_run['value']} emails_found_total={emails_found_total} domains_with_primary_email={domains_with_primary} domains_no_email={domains_no_email}")
+    all_emails: List[Dict[str, Any]] = []
+    for row_result in results:
+        all_emails.extend(json.loads(row_result["all_emails_json"]))
+    hist = compute_position_histogram(all_emails)
+    hist_parts = [f"1-3={hist['1-3']}", f"4-10={hist['4-10']}", f"11-20={hist['11-20']}"]
+    if hist[">20"]:
+        hist_parts.append(f">20={hist['>20']}")
+    print("POSITION_HISTOGRAM " + " ".join(hist_parts))
 
     with open("serper_enrich_results.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["domain", "persona", "confidence_score", "primary_email", "all_emails_json", "source_urls_json"])
