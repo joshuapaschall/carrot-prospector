@@ -26,6 +26,12 @@ EXTRA_BLOCKED_DOMAINS = {
 }
 EXTRA_BLOCKED_PREFIXES = ("no-reply@", "noreply@", "postmaster@", "abuse@", "support@facebook.com")
 FREE_PROVIDERS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com", "icloud.com"}
+EMAIL_BROKER_DOMAINS = {
+    "rocketreach.co", "prospeo.io", "neverbounce.com", "hunter.io", "snov.io", "lusha.com", "leadiq.com",
+    "signalhire.com", "contactout.com", "clearbit.com", "zoominfo.com", "apollo.io", "kaspr.io",
+    "findthatlead.com", "voilanorbert.com", "anymailfinder.com", "skrapp.io", "getprospect.com", "uplead.com",
+    "adapt.io", "nymeria.io", "emailformat.com", "email-format.com", "rocketreach.com",
+}
 
 
 @dataclass
@@ -89,7 +95,15 @@ def is_valid_enrich_email(email: str) -> bool:
         return False
     if "@" not in e:
         return False
-    _, domain = e.split("@", 1)
+    local, domain = e.split("@", 1)
+    placeholder_locals = {
+        "jane.doe", "john.doe", "john.smith", "jane.smith", "firstname.lastname", "first.last",
+        "name", "email", "user", "example", "j", "f",
+    }
+    if len(local) == 1:
+        return False
+    if local in placeholder_locals:
+        return False
     if domain in EXTRA_BLOCKED_DOMAINS:
         return False
     if domain.endswith("sentry-next.wixpress.com"):
@@ -104,6 +118,11 @@ def extract_serper_emails(organic: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
         title = str(item.get("title") or "")
         snippet = str(item.get("snippet") or "")
         link = str(item.get("link") or "")
+        link_host = ""
+        if "//" in link:
+            link_host = link.split("//", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        if registrable(link_host) in EMAIL_BROKER_DOMAINS:
+            continue
         blob = f"{title} {snippet} {link}"
         for match in EMAIL_RE.findall(blob):
             em = match.lower().strip(".,;:()[]{}<>\"'")
@@ -192,6 +211,18 @@ def run_self_test() -> None:
     organic3 = [{"title": "dir", "snippet": "name@domain.com x@facebook.com", "link": "https://facebook.com/x"}]
     emails3, _ = extract_serper_emails(organic3)
     assert len(emails3) == 0
+
+    organic_broker = [{"title": "RocketReach", "snippet": "jane.doe@wanttosellnow.com", "link": "https://rocketreach.co/wanttosellnow"}]
+    emails_broker, _ = extract_serper_emails(organic_broker)
+    assert len(emails_broker) == 0
+
+    assert is_valid_enrich_email("jane.doe@example-domain.com") is False
+    assert is_valid_enrich_email("j@example-domain.com") is False
+
+    gmail_primary = classify_primary("wanttosellnow.com", "want to sell now", [{"email": "seo1.imperial@gmail.com", "source_url": "u", "position": 1}], {"seo1.imperial@gmail.com": "want to sell now"})
+    ondomain_primary = classify_primary("wanttosellnow.com", "", [{"email": "info@wanttosellnow.com", "source_url": "u", "position": 1}], {"info@wanttosellnow.com": "info@wanttosellnow.com"})
+    assert bool(gmail_primary and gmail_primary.split("@", 1)[1] in FREE_PROVIDERS) is True
+    assert bool(ondomain_primary and ondomain_primary.split("@", 1)[1] in FREE_PROVIDERS) is False
 
     budget_stop = {"stop": False}
     requests_made = {"value": 0}
@@ -305,6 +336,7 @@ async def main_async(args: argparse.Namespace) -> None:
                             "primary_email": primary,
                             "all_emails_json": json.dumps(serper_emails),
                             "source_urls_json": json.dumps([x.get("source_url") for x in serper_emails]),
+                            "primary_is_free_provider": str(bool(primary and primary.split("@", 1)[1] in FREE_PROVIDERS)).lower(),
                         })
                         if processed % BATCH_LOG_EVERY == 0:
                             print(f"processed={processed} requests_made={requests_made['value']} credits_spent_this_run={credits_spent_this_run['value']} emails_found_total={emails_found_total} domains_with_primary_email={domains_with_primary} domains_no_email={domains_no_email}")
@@ -327,7 +359,7 @@ async def main_async(args: argparse.Namespace) -> None:
     print("POSITION_HISTOGRAM " + " ".join(hist_parts))
 
     with open("serper_enrich_results.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["domain", "persona", "confidence_score", "primary_email", "all_emails_json", "source_urls_json"])
+        w = csv.DictWriter(f, fieldnames=["domain", "persona", "confidence_score", "primary_email", "primary_is_free_provider", "all_emails_json", "source_urls_json"])
         w.writeheader()
         w.writerows(results)
 
