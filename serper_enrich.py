@@ -171,8 +171,19 @@ def fetch_targets(sb: Any, persona: str, limit: Optional[int]) -> List[DomainRow
     q = sb.table("domains").select("domain,persona,confidence_score,business_name,email,signals").eq("qualified", True).is_("email", "null")
     if persona != "all":
         q = q.eq("persona", persona)
-    resp = supabase_execute_with_retry(lambda: q.limit(limit or 50000), domain=None, is_write=False)
-    data = (resp.data if resp and hasattr(resp, "data") else []) or []
+    page_size = 1000
+    start = 0
+    data: List[Dict[str, Any]] = []
+    while True:
+        end = start + page_size - 1
+        resp = supabase_execute_with_retry(lambda s=start, e=end: q.range(s, e), domain=None, is_write=False)
+        page = (resp.data if resp and hasattr(resp, "data") else []) or []
+        if not page:
+            break
+        data.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
     rows: List[DomainRow] = []
     for r in data:
         signals = r.get("signals") if isinstance(r.get("signals"), dict) else {}
